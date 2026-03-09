@@ -1,0 +1,13 @@
+{
+  "name": "private-credit-daily-monitor",
+  "display_name": "Private Credit Daily Monitor",
+  "type": "skill",
+  "entry": "SKILL.md",
+  "post_install": [
+    "python scripts/self_check.py"
+  ],
+  "manual_init": [
+    "python scripts/setup_scheduler.py --workspace .",
+    "python scripts/update_monitor.py --workspace ."
+  ]
+}
