@@ -1,44 +1,125 @@
 import argparse
 import csv
 import io
+import re
 import shutil
 import statistics
+import time
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List, Tuple
+from urllib.parse import quote_plus
 
 import openpyxl
 import requests
-from openpyxl import Workbook
 from openpyxl.worksheet.worksheet import Worksheet
+from requests.exceptions import RequestException
 
-STOOQ_SYMBOLS = [
-    "SPY", "XLF", "BLK", "BX", "APO", "ARES", "OWL", "KKR",
-    "BIZD", "HYG", "BKLN", "JBBB", "LQD",
+REQUEST_TIMEOUT = 40
+RETRIES = 2
+RETRY_WAIT_SECONDS = 2
+
+TEMPLATE_NAME = "private_credit_monitor_template.xlsx"
+
+ROW_IDS = [
+    "EW-01", "EW-02", "EW-03", "EW-04", "EW-05",
+    "TR-01", "TR-02", "TR-03", "TR-04", "TR-05", "TR-06",
+    "SY-01", "SY-02", "SY-03", "SY-04", "SY-05",
 ]
 
-TRACKED_IDS = ["EW-02", "EW-03", "EW-04", "TR-06", "SY-01", "SY-04"]
+NEWS_RULES = {
+    "EW-01": {
+        "query": '"private credit" OR BDC gate OR "redemption suspension" OR "withdrawal suspension" OR "redemption limit"',
+        "automation": "新闻聚类",
+        "source": "Google News RSS / 主流媒体",
+        "yellow": 1,
+        "red": 3,
+        "label": "限赎 / Gate",
+    },
+    "EW-05": {
+        "query": '"private credit" fraud OR "valuation dispute" OR default OR restructuring OR "payment suspension"',
+        "automation": "新闻聚类",
+        "source": "Google News RSS / 主流媒体",
+        "yellow": 2,
+        "red": 5,
+        "label": "坏消息簇发",
+    },
+    "TR-01": {
+        "query": '"private credit" default OR restructuring OR "amend and extend" OR "debt exchange"',
+        "automation": "新闻聚类",
+        "source": "Google News RSS / 主流媒体",
+        "yellow": 2,
+        "red": 5,
+        "label": "违约 / 重组 / 展期",
+    },
+    "TR-02": {
+        "query": '"private credit" PIK OR "paid in kind" OR "payment in kind"',
+        "automation": "新闻聚类",
+        "source": "Google News RSS / 主流媒体",
+        "yellow": 1,
+        "red": 3,
+        "label": "PIK 增多",
+    },
+    "TR-04": {
+        "query": '"private credit" fundraising slowdown OR "fundraising slows" OR "difficult to raise" OR "fund close delayed"',
+        "automation": "新闻聚类",
+        "source": "Google News RSS / 主流媒体",
+        "yellow": 2,
+        "red": 5,
+        "label": "募资放缓",
+    },
+    "TR-05": {
+        "query": '"private credit" tighter terms OR covenant OR "spread wider" OR "deal pulled" OR "financing delayed"',
+        "automation": "新闻聚类",
+        "source": "Google News RSS / 主流媒体",
+        "yellow": 2,
+        "red": 5,
+        "label": "条款收紧",
+    },
+    "SY-03": {
+        "query": '"private credit" pension reduce allocation OR insurer reduce allocation OR "trim exposure" OR "cut allocation"',
+        "automation": "新闻聚类",
+        "source": "Google News RSS / 主流媒体",
+        "yellow": 1,
+        "red": 3,
+        "label": "长钱减配",
+    },
+    "SY-05": {
+        "query": '"small business" refinancing failure OR bankruptcy OR layoffs OR capex cuts OR "unable to refinance"',
+        "automation": "新闻聚类",
+        "source": "Google News RSS / 主流媒体",
+        "yellow": 3,
+        "red": 6,
+        "label": "中小企业再融资失败",
+    },
+}
 
-HEADERS = [
-    "编号",
-    "一级模块",
-    "二级模块",
-    "监控指标",
-    "说明",
-    "更新频率",
-    "最近更新时间",
-    "状态",
-    "状态依据（具体数据+来源）",
-    "分数",
-    "备注 / 下一步动作",
-]
+MANAGER_STOCKS = ["BLK", "BX", "APO", "ARES", "OWL", "KKR"]
+ALL_STOOQ = ["SPY", "XLF", "KBE", "BLK", "BX", "APO", "ARES", "OWL", "KKR", "BIZD", "HYG", "BKLN", "JBBB", "LQD", "JNK"]
+FRED_SERIES = {
+    "HY_OAS": "BAMLH0A0HYM2",
+    "IG_OAS": "BAMLC0A0CM",
+    "SOFR": "SOFR",
+    "ANFCI": "ANFCI",
+}
 
 
 def fetch_text(url: str) -> str:
     headers = {"User-Agent": "Mozilla/5.0"}
-    resp = requests.get(url, headers=headers, timeout=20)
-    resp.raise_for_status()
-    return resp.text
+    last_err = None
+    for attempt in range(RETRIES + 1):
+        try:
+            resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            return resp.text
+        except RequestException as exc:
+            last_err = exc
+            if attempt < RETRIES:
+                time.sleep(RETRY_WAIT_SECONDS)
+            else:
+                raise RuntimeError(f"request failed after retries: {url} | {exc}")
+    raise RuntimeError(f"request failed unexpectedly: {url} | {last_err}")
 
 
 def stooq_last(symbol: str) -> Dict[str, float | str]:
@@ -46,22 +127,15 @@ def stooq_last(symbol: str) -> Dict[str, float | str]:
     txt = fetch_text(url).strip().splitlines()
     rows = list(csv.DictReader(io.StringIO("\n".join(txt))))
     rows = [r for r in rows if r.get("Close")]
-
     if len(rows) < 2:
         raise RuntimeError(f"Not enough rows for Stooq symbol {symbol}")
 
     last = rows[-1]
     prev = rows[-6] if len(rows) >= 6 else rows[0]
-
-    close_now = float(last["Close"])
-    close_prev = float(prev["Close"])
-    chg5d = (close_now / close_prev - 1.0) * 100 if close_prev else 0.0
-
-    return {
-        "date": last["Date"],
-        "chg5d": chg5d,
-        "close": close_now,
-    }
+    c = float(last["Close"])
+    p = float(prev["Close"])
+    chg5d = (c / p - 1.0) * 100 if p else 0.0
+    return {"date": last["Date"], "chg5d": chg5d, "close": c}
 
 
 def fred_last(series: str) -> Dict[str, float | str]:
@@ -69,56 +143,51 @@ def fred_last(series: str) -> Dict[str, float | str]:
     txt = fetch_text(url).strip().splitlines()
     rows = list(csv.DictReader(io.StringIO("\n".join(txt))))
     rows = [r for r in rows if r.get(series) and r[series] != "."]
-
     if not rows:
         raise RuntimeError(f"No rows for FRED series {series}")
-
     last = rows[-1]
-    return {
-        "date": last["observation_date"],
-        "value": float(last[series]),
-    }
+    return {"date": last["observation_date"], "value": float(last[series])}
 
 
-def create_minimal_workbook(path: Path) -> None:
-    wb = Workbook()
-    dash = wb.active
-    dash.title = "Dashboard"
-    dash["A1"] = "Private Credit Daily Monitor"
-    dash["A3"] = "最近更新日期"
-    dash["B3"] = ""
+def google_news_rss(query: str, max_items: int = 8) -> List[Dict[str, str]]:
+    url = f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=en-US&gl=US&ceid=US:en"
+    xml_text = fetch_text(url)
+    root = ET.fromstring(xml_text)
 
-    checklist = wb.create_sheet("Checklist")
-    for idx, header in enumerate(HEADERS, start=1):
-        checklist.cell(row=5, column=idx, value=header)
+    results: List[Dict[str, str]] = []
+    seen = set()
 
-    rows = [
-        ("EW-02", "市场定价", "上市资管股", "资管股相对收益", "5日相对表现"),
-        ("EW-03", "市场定价", "BDC", "BDC 相对高收益债", "5日相对表现"),
-        ("EW-04", "市场定价", "信用压力", "HY/Loan/CLO 弱化", "综合弱项数"),
-        ("TR-06", "融资条件", "短端利率", "SOFR", "利率水平"),
-        ("SY-01", "系统环境", "金融条件", "ANFCI", "金融条件压力"),
-        ("SY-04", "系统环境", "信用偏好", "IG vs HY", "LQD-HYG 与 IG OAS"),
-    ]
-    for row_idx, item in enumerate(rows, start=6):
-        checklist.cell(row=row_idx, column=1, value=item[0])
-        checklist.cell(row=row_idx, column=2, value=item[1])
-        checklist.cell(row=row_idx, column=3, value=item[2])
-        checklist.cell(row=row_idx, column=4, value=item[3])
-        checklist.cell(row=row_idx, column=5, value=item[4])
+    for item in root.findall(".//item"):
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        pub_date = (item.findtext("pubDate") or "").strip()
+        source = ""
+        source_node = item.find("source")
+        if source_node is not None and source_node.text:
+            source = source_node.text.strip()
 
-    wb.save(path)
+        norm = re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", title.lower())).strip()
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+
+        results.append({
+            "title": title,
+            "link": link,
+            "date": pub_date,
+            "source": source or "Google News RSS",
+        })
+        if len(results) >= max_items:
+            break
+    return results
 
 
-def ensure_master_template(master: Path, asset_template: Path) -> None:
+def ensure_workbook(master: Path, asset_template: Path) -> None:
     if master.exists():
         return
-
-    if asset_template.exists():
-        shutil.copy2(asset_template, master)
-        return
-
-    create_minimal_workbook(master)
+    if not asset_template.exists():
+        raise FileNotFoundError(f"Template not found: {asset_template}")
+    shutil.copy2(asset_template, master)
 
 
 def ensure_sheet(wb: openpyxl.Workbook, title: str) -> Worksheet:
@@ -127,63 +196,108 @@ def ensure_sheet(wb: openpyxl.Workbook, title: str) -> Worksheet:
     return wb.create_sheet(title)
 
 
-def ensure_checklist_structure(ws: Worksheet) -> None:
-    for idx, header in enumerate(HEADERS, start=1):
-        if ws.cell(row=5, column=idx).value != header:
-            ws.cell(row=5, column=idx, value=header)
-
-    existing_ids = {
-        ws.cell(row=r, column=1).value: r
-        for r in range(6, ws.max_row + 1)
-        if ws.cell(row=r, column=1).value
-    }
-
-    defaults = [
-        ("EW-02", "市场定价", "上市资管股", "资管股相对收益", "5日相对表现"),
-        ("EW-03", "市场定价", "BDC", "BDC 相对高收益债", "5日相对表现"),
-        ("EW-04", "市场定价", "信用压力", "HY/Loan/CLO 弱化", "综合弱项数"),
-        ("TR-06", "融资条件", "短端利率", "SOFR", "利率水平"),
-        ("SY-01", "系统环境", "金融条件", "ANFCI", "金融条件压力"),
-        ("SY-04", "系统环境", "信用偏好", "LQD-HYG 与 IG OAS", "相对偏好"),
-    ]
-
-    next_row = max(ws.max_row + 1, 6)
-    for item in defaults:
-        if item[0] not in existing_ids:
-            row = next_row
-            next_row += 1
-            ws.cell(row=row, column=1, value=item[0])
-            ws.cell(row=row, column=2, value=item[1])
-            ws.cell(row=row, column=3, value=item[2])
-            ws.cell(row=row, column=4, value=item[3])
-            ws.cell(row=row, column=5, value=item[4])
-
-
 def build_row_map(ws: Worksheet) -> Dict[str, int]:
     result: Dict[str, int] = {}
     for r in range(6, ws.max_row + 1):
-        key = ws.cell(row=r, column=1).value
-        if key:
-            result[str(key)] = r
+        rid = ws.cell(r, 1).value
+        if rid:
+            result[str(rid)] = r
     return result
 
 
-def set_status(ws: Worksheet, row: int, status: str, evidence: str, note: str = "") -> None:
-    ws.cell(row=row, column=8, value=status)
-    ws.cell(row=row, column=9, value=evidence)
-    score = {"绿灯": 0, "黄灯": 1, "红灯": 2, "待更新": ""}.get(status, "")
-    ws.cell(row=row, column=10, value=score)
-    ws.cell(row=row, column=11, value=note)
+def ensure_checklist_columns(ws: Worksheet) -> Dict[str, int]:
+    required = [
+        "状态依据（具体数据+来源）",
+        "证据链接 / Evidence IDs",
+        "自动化方式",
+        "主数据源",
+        "备注 / 下一步动作",
+    ]
+
+    header_index: Dict[str, int] = {}
+    for c in range(1, ws.max_column + 1):
+        h = ws.cell(5, c).value
+        if h:
+            header_index[str(h)] = c
+
+    next_col = ws.max_column
+    for req in required:
+        if req not in header_index:
+            next_col += 1
+            ws.cell(5, next_col, req)
+            header_index[req] = next_col
+
+    final_map: Dict[str, int] = {}
+    for c in range(1, ws.max_column + 1):
+        h = ws.cell(5, c).value
+        if h:
+            final_map[str(h)] = c
+    return final_map
+
+
+def ensure_evidence_sheet(ws: Worksheet) -> None:
+    headers = ["Evidence ID", "指标ID", "媒体", "标题", "日期", "链接"]
+    for idx, h in enumerate(headers, start=1):
+        ws.cell(1, idx, h)
+
+
+def clear_evidence(ws: Worksheet) -> None:
+    if ws.max_row > 1:
+        ws.delete_rows(2, ws.max_row - 1)
+
+
+def append_evidence(ws: Worksheet, items: List[Tuple[str, str, str, str, str, str]]) -> None:
+    row = ws.max_row + 1
+    for ev_id, rid, media, title, dt, link in items:
+        ws.cell(row, 1, ev_id)
+        ws.cell(row, 2, rid)
+        ws.cell(row, 3, media)
+        ws.cell(row, 4, title)
+        ws.cell(row, 5, dt)
+        ws.cell(row, 6, link)
+        row += 1
+
+
+def set_row(
+    ws: Worksheet,
+    row: int,
+    colmap: Dict[str, int],
+    status: str,
+    rationale: str,
+    evidence_ids: str,
+    automation: str,
+    source: str,
+    note: str = "",
+) -> None:
+    ws.cell(row, 8).value = status
+    ws.cell(row, 9).value = {"绿灯": 0, "黄灯": 1, "红灯": 2, "待更新": ""}.get(status, "")
+    ws.cell(row, colmap["状态依据（具体数据+来源）"]).value = rationale
+    ws.cell(row, colmap["证据链接 / Evidence IDs"]).value = evidence_ids
+    ws.cell(row, colmap["自动化方式"]).value = automation
+    ws.cell(row, colmap["主数据源"]).value = source
+    ws.cell(row, colmap["备注 / 下一步动作"]).value = note
+
+
+def classify_news(items: List[Dict[str, str]], yellow: int, red: int) -> str:
+    count = len(items)
+    if count >= red:
+        return "红灯"
+    if count >= yellow:
+        return "黄灯"
+    return "绿灯"
+
+
+def format_news_rationale(label: str, items: List[Dict[str, str]]) -> str:
+    if not items:
+        return f"过去一轮未发现明确的{label}主流媒体高相关报道。"
+    medias = sorted({x['source'] for x in items if x.get('source')})
+    return f"近一轮共捕获 {len(items)} 条与{label}相关报道；来源包括：{', '.join(medias[:4])}。请结合 Evidence sheet 复核是否误报。"
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Update private credit monitor workbook")
-    parser.add_argument("--workspace", default=".", help="Directory for outputs")
-    parser.add_argument(
-        "--master",
-        default="private_credit_monitor_master_template.xlsx",
-        help="Master workbook filename inside workspace",
-    )
+    parser = argparse.ArgumentParser(description="Update private credit monitor workbook using formal template")
+    parser.add_argument("--workspace", default=".", help="Workspace directory")
+    parser.add_argument("--master", default="private_credit_monitor_master_template.xlsx", help="Master workbook filename")
     args = parser.parse_args()
 
     workspace = Path(args.workspace).resolve()
@@ -192,101 +306,219 @@ def main() -> None:
     master = workspace / args.master
     latest = workspace / "private_credit_monitor_latest.xlsx"
     daily = workspace / f"private_credit_monitor_{datetime.now().strftime('%Y-%m-%d')}.xlsx"
-    asset_template = Path(__file__).resolve().parents[1] / "assets" / "private_credit_monitor_template.xlsx"
+    asset_template = Path(__file__).resolve().parents[1] / "assets" / TEMPLATE_NAME
 
-    ensure_master_template(master, asset_template)
+    ensure_workbook(master, asset_template)
 
     wb = openpyxl.load_workbook(master)
+    checklist = wb["Checklist"]
     dashboard = ensure_sheet(wb, "Dashboard")
-    checklist = ensure_sheet(wb, "Checklist")
-    ensure_checklist_structure(checklist)
+    evidence_ws = ensure_sheet(wb, "Evidence")
+
+    colmap = ensure_checklist_columns(checklist)
+    ensure_evidence_sheet(evidence_ws)
+    clear_evidence(evidence_ws)
 
     row_map = build_row_map(checklist)
-
-    market_data = {symbol: stooq_last(symbol) for symbol in STOOQ_SYMBOLS}
-    fred = {
-        "HY_OAS": fred_last("BAMLH0A0HYM2"),
-        "IG_OAS": fred_last("BAMLC0A0CM"),
-        "SOFR": fred_last("SOFR"),
-        "ANFCI": fred_last("ANFCI"),
-    }
-
-    for rid in TRACKED_IDS:
+    for rid in ROW_IDS:
         if rid not in row_map:
-            raise KeyError(f"Required row id missing: {rid}")
+            raise RuntimeError(f"正式模板缺少指标行：{rid}")
 
-    mgr_symbols = ["BLK", "BX", "APO", "ARES", "OWL", "KKR"]
-    mgr_avg = statistics.mean(float(market_data[s]["chg5d"]) for s in mgr_symbols)
-    bench_avg = statistics.mean([float(market_data["SPY"]["chg5d"]), float(market_data["XLF"]["chg5d"])])
-    rel_mgr = mgr_avg - bench_avg
+    market: Dict[str, Dict[str, float | str]] = {}
+    for symbol in ALL_STOOQ:
+        try:
+            market[symbol] = stooq_last(symbol)
+        except Exception as exc:
+            print(f"[WARN] Stooq failed for {symbol}: {exc}")
 
-    row = row_map["EW-02"]
-    status = "绿灯" if rel_mgr > -1 else ("黄灯" if rel_mgr > -3 else "红灯")
-    evidence = (
-        f"5日相对收益：资管股均值 {mgr_avg:.2f}% vs SPY/XLF 均值 {bench_avg:.2f}%，"
-        f"差值 {rel_mgr:.2f}%。来源: Stooq ({market_data['BLK']['date']})."
-    )
-    set_status(checklist, row, status, evidence)
+    fred: Dict[str, Dict[str, float | str]] = {}
+    for alias, series in FRED_SERIES.items():
+        try:
+            fred[alias] = fred_last(series)
+        except Exception as exc:
+            print(f"[WARN] FRED failed for {series}: {exc}")
 
-    rel_bdc = float(market_data["BIZD"]["chg5d"]) - float(market_data["HYG"]["chg5d"])
-    row = row_map["EW-03"]
-    status = "绿灯" if rel_bdc >= -1 else ("黄灯" if rel_bdc >= -3 else "红灯")
-    evidence = (
-        f"5日 BIZD {market_data['BIZD']['chg5d']:.2f}% vs HYG {market_data['HYG']['chg5d']:.2f}%，"
-        f"相对 {rel_bdc:.2f}%。来源: Stooq ({market_data['BIZD']['date']})."
-    )
-    set_status(checklist, row, status, evidence)
+    evidence_rows: List[Tuple[str, str, str, str, str, str]] = []
+    evidence_counter = 1
 
-    hy_oas = float(fred["HY_OAS"]["value"])
-    loan_5d = float(market_data["BKLN"]["chg5d"])
-    clo_5d = float(market_data["JBBB"]["chg5d"])
-    weak_count = sum([
-        1 if hy_oas > 4.0 else 0,
-        1 if loan_5d < 0 else 0,
-        1 if clo_5d < 0 else 0,
-    ])
+    def add_news_metric(rid: str) -> None:
+        nonlocal evidence_counter
+        cfg = NEWS_RULES[rid]
+        row = row_map[rid]
+        try:
+            items = google_news_rss(cfg["query"], max_items=6)
+            status = classify_news(items, cfg["yellow"], cfg["red"])
+            rationale = format_news_rationale(cfg["label"], items)
 
-    row = row_map["EW-04"]
-    status = "绿灯" if weak_count == 0 else ("黄灯" if weak_count == 1 else "红灯")
-    evidence = (
-        f"HY OAS={hy_oas:.2f}% ({fred['HY_OAS']['date']}), "
-        f"BKLN 5日 {loan_5d:.2f}%, JBBB 5日 {clo_5d:.2f}%，弱项 {weak_count}/3。来源: FRED + Stooq."
-    )
-    set_status(checklist, row, status, evidence)
+            ev_ids: List[str] = []
+            for item in items[:5]:
+                ev_id = f"EV-{evidence_counter:03d}"
+                evidence_counter += 1
+                ev_ids.append(ev_id)
+                evidence_rows.append((ev_id, rid, item["source"], item["title"], item["date"], item["link"]))
 
-    sofr = float(fred["SOFR"]["value"])
-    row = row_map["TR-06"]
-    status = "绿灯" if sofr < 4 else ("黄灯" if sofr < 5 else "红灯")
-    evidence = f"SOFR={sofr:.3f}% ({fred['SOFR']['date']})。来源: FRED."
-    set_status(checklist, row, status, evidence)
+            set_row(
+                checklist,
+                row,
+                colmap,
+                status,
+                rationale,
+                ", ".join(ev_ids),
+                cfg["automation"],
+                cfg["source"],
+            )
+        except Exception as exc:
+            set_row(
+                checklist,
+                row,
+                colmap,
+                "待更新",
+                f"新闻抓取失败：{exc}",
+                "",
+                cfg["automation"],
+                cfg["source"],
+            )
 
-    anfci = float(fred["ANFCI"]["value"])
-    row = row_map["SY-01"]
-    status = "绿灯" if anfci < 0 else ("黄灯" if anfci < 0.5 else "红灯")
-    evidence = f"ANFCI={anfci:.3f} ({fred['ANFCI']['date']})。来源: FRED."
-    set_status(checklist, row, status, evidence)
+    for rid in ["EW-01", "EW-05", "TR-01", "TR-02", "TR-04", "TR-05", "SY-03", "SY-05"]:
+        add_news_metric(rid)
 
-    ig_oas = float(fred["IG_OAS"]["value"])
-    lqd_minus_hyg = float(market_data["LQD"]["chg5d"]) - float(market_data["HYG"]["chg5d"])
-    row = row_map["SY-04"]
-    status = "绿灯" if ig_oas < 1.4 and lqd_minus_hyg >= 0 else ("黄灯" if ig_oas < 1.8 else "红灯")
-    evidence = (
-        f"IG OAS={ig_oas:.2f}% ({fred['IG_OAS']['date']}); "
-        f"LQD-HYG 5日相对={lqd_minus_hyg:.2f}%。来源: FRED + Stooq."
-    )
-    set_status(checklist, row, status, evidence)
+    rid = "EW-02"
+    row = row_map[rid]
+    need = MANAGER_STOCKS + ["SPY", "XLF"]
+    if all(x in market for x in need):
+        mgr_avg = statistics.mean([market[s]["chg5d"] for s in MANAGER_STOCKS])
+        bench_avg = statistics.mean([market["SPY"]["chg5d"], market["XLF"]["chg5d"]])
+        rel = mgr_avg - bench_avg
+        status = "绿灯" if rel > -1 else ("黄灯" if rel > -3 else "红灯")
+        rationale = f"5日相对收益：资管股均值 {mgr_avg:.2f}% vs SPY/XLF 均值 {bench_avg:.2f}%，差值 {rel:.2f}%。来源：Stooq。"
+        set_row(checklist, row, colmap, status, rationale, "", "数值直抓", "Stooq")
+    else:
+        missing = [x for x in need if x not in market]
+        set_row(checklist, row, colmap, "待更新", f"Stooq 获取失败：{','.join(missing)}", "", "数值直抓", "Stooq")
 
-    dashboard["A1"] = "Private Credit Daily Monitor"
-    dashboard["A3"] = "最近更新日期"
-    dashboard["B3"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rid = "EW-03"
+    row = row_map[rid]
+    if "BIZD" in market and "HYG" in market:
+        rel_bdc = market["BIZD"]["chg5d"] - market["HYG"]["chg5d"]
+        status = "绿灯" if rel_bdc >= -1 else ("黄灯" if rel_bdc >= -3 else "红灯")
+        rationale = f"5日 BIZD {market['BIZD']['chg5d']:.2f}% vs HYG {market['HYG']['chg5d']:.2f}%，相对 {rel_bdc:.2f}%。作为 BDC 折价代理。"
+        set_row(checklist, row, colmap, status, rationale, "", "代理数值", "Stooq")
+    else:
+        set_row(checklist, row, colmap, "待更新", "BDC/HY 代理数据获取失败", "", "代理数值", "Stooq")
+
+    rid = "EW-04"
+    row = row_map[rid]
+    if "HY_OAS" in fred and "BKLN" in market and "JBBB" in market:
+        hy = fred["HY_OAS"]["value"]
+        loan = market["BKLN"]["chg5d"]
+        clo = market["JBBB"]["chg5d"]
+        weak = sum([1 if hy > 4.0 else 0, 1 if loan < 0 else 0, 1 if clo < 0 else 0])
+        status = "绿灯" if weak == 0 else ("黄灯" if weak == 1 else "红灯")
+        rationale = f"HY OAS={hy:.2f}%({fred['HY_OAS']['date']}), BKLN 5日 {loan:.2f}%, JBBB 5日 {clo:.2f}%；弱项 {weak}/3。来源：FRED+Stooq。"
+        set_row(checklist, row, colmap, status, rationale, "", "数值直抓", "FRED + Stooq")
+    else:
+        set_row(checklist, row, colmap, "待更新", "HY/Loan/CLO 代理数据不完整", "", "数值直抓", "FRED + Stooq")
+
+    rid = "TR-03"
+    row = row_map[rid]
+    if "BIZD" in market and "LQD" in market:
+        rel = market["BIZD"]["chg5d"] - market["LQD"]["chg5d"]
+        status = "绿灯" if rel > -1 else ("黄灯" if rel > -3 else "红灯")
+        rationale = f"以 BDC 相对 IG 代理 NAV 压力：BIZD-LQD 5日差值 {rel:.2f}%。若持续弱于 IG，通常对应账面压力上升。"
+        set_row(checklist, row, colmap, status, rationale, "", "代理数值", "Stooq")
+    else:
+        set_row(checklist, row, colmap, "待更新", "NAV 代理数据获取失败", "", "代理数值", "Stooq")
+
+    rid = "TR-06"
+    row = row_map[rid]
+    if "SOFR" in fred and "ANFCI" in fred:
+        sofr = fred["SOFR"]["value"]
+        anfci = fred["ANFCI"]["value"]
+        status = "绿灯" if (sofr < 4 and anfci < 0.25) else ("黄灯" if (sofr < 5 and anfci < 0.75) else "红灯")
+        rationale = f"SOFR={sofr:.3f}%({fred['SOFR']['date']}), ANFCI={anfci:.3f}({fred['ANFCI']['date']})。用短端资金与金融条件代理仓储融资/过桥成本。"
+        set_row(checklist, row, colmap, status, rationale, "", "代理数值", "FRED")
+    else:
+        set_row(checklist, row, colmap, "待更新", "SOFR/ANFCI 获取失败", "", "代理数值", "FRED")
+
+    rid = "SY-01"
+    row = row_map[rid]
+    if "ANFCI" in fred and "KBE" in market:
+        anfci = fred["ANFCI"]["value"]
+        kbe = market["KBE"]["chg5d"]
+        status = "绿灯" if anfci < 0 and kbe > -2 else ("黄灯" if anfci < 0.5 and kbe > -5 else "红灯")
+        rationale = f"ANFCI={anfci:.3f}，KBE 5日={kbe:.2f}%。以金融条件和银行股表现代理授信收紧。"
+        set_row(checklist, row, colmap, status, rationale, "", "代理数值", "FRED + Stooq")
+    else:
+        set_row(checklist, row, colmap, "待更新", "银行传导代理数据获取失败", "", "代理数值", "FRED + Stooq")
+
+    rid = "SY-02"
+    row = row_map[rid]
+    try:
+        bank_news = google_news_rss('"bank provisions" OR "loan loss provisions" OR "credit reserves" banks', max_items=5)
+        bank_status = classify_news(bank_news, 2, 4)
+        ev_ids: List[str] = []
+
+        for item in bank_news[:4]:
+            ev_id = f"EV-{evidence_counter:03d}"
+            evidence_counter += 1
+            ev_ids.append(ev_id)
+            evidence_rows.append((ev_id, rid, item["source"], item["title"], item["date"], item["link"]))
+
+        if "KBE" in market:
+            kbe = market["KBE"]["chg5d"]
+            if bank_status == "绿灯" and kbe > -2:
+                status = "绿灯"
+            elif bank_status == "红灯" or kbe < -5:
+                status = "红灯"
+            else:
+                status = "黄灯"
+            rationale = f"银行拨备相关新闻 {len(bank_news)} 条；KBE 5日 {kbe:.2f}%。结合新闻与银行股表现判断。"
+        else:
+            status = bank_status
+            rationale = f"银行拨备相关新闻 {len(bank_news)} 条。缺少 KBE 价格时仅按新闻聚类判断。"
+
+        set_row(checklist, row, colmap, status, rationale, ", ".join(ev_ids), "混合：新闻+代理数值", "Google News RSS + Stooq")
+    except Exception as exc:
+        set_row(checklist, row, colmap, "待更新", f"银行拨备监控失败：{exc}", "", "混合：新闻+代理数值", "Google News RSS + Stooq")
+
+    rid = "SY-04"
+    row = row_map[rid]
+    if "IG_OAS" in fred and "LQD" in market and "HYG" in market and "XLF" in market:
+        ig = fred["IG_OAS"]["value"]
+        lqd_hyg = market["LQD"]["chg5d"] - market["HYG"]["chg5d"]
+        xlf = market["XLF"]["chg5d"]
+
+        if ig < 1.4 and lqd_hyg >= 0 and xlf > -2:
+            status = "绿灯"
+        elif ig < 1.8 and xlf > -4:
+            status = "黄灯"
+        else:
+            status = "红灯"
+
+        rationale = f"IG OAS={ig:.2f}%({fred['IG_OAS']['date']}), LQD-HYG 5日相对={lqd_hyg:.2f}%，XLF 5日={xlf:.2f}%。"
+        set_row(checklist, row, colmap, status, rationale, "", "数值直抓", "FRED + Stooq")
+    else:
+        set_row(checklist, row, colmap, "待更新", "IG/信用外溢数据不完整", "", "数值直抓", "FRED + Stooq")
+
+    append_evidence(evidence_ws, evidence_rows)
+
+    dashboard["A4"] = "更新日期"
+    dashboard["A5"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     wb.save(master)
     wb.save(latest)
     wb.save(daily)
 
-    print(f"Master updated: {master}")
-    print(f"Latest snapshot: {latest}")
-    print(f"Daily archive: {daily}")
+    status_counts = {"绿灯": 0, "黄灯": 0, "红灯": 0, "待更新": 0}
+    for rid in ROW_IDS:
+        st = checklist.cell(row_map[rid], 8).value
+        if st in status_counts:
+            status_counts[st] += 1
+
+    print(f"updated: {latest}")
+    print(f"daily: {daily}")
+    print(f"evidence_rows: {len(evidence_rows)}")
+    print(f"status_counts: {status_counts}")
 
 
 if __name__ == "__main__":
