@@ -96,7 +96,10 @@ NEWS_RULES = {
 }
 
 MANAGER_STOCKS = ["BLK", "BX", "APO", "ARES", "OWL", "KKR"]
-ALL_STOOQ = ["SPY", "XLF", "KBE", "BLK", "BX", "APO", "ARES", "OWL", "KKR", "BIZD", "HYG", "BKLN", "JBBB", "LQD", "JNK"]
+ALL_STOOQ = [
+    "SPY", "XLF", "KBE", "BLK", "BX", "APO", "ARES", "OWL", "KKR",
+    "BIZD", "HYG", "BKLN", "JBBB", "LQD", "JNK"
+]
 FRED_SERIES = {
     "HY_OAS": "BAMLH0A0HYM2",
     "IG_OAS": "BAMLC0A0CM",
@@ -224,7 +227,7 @@ def ensure_checklist_columns(ws: Worksheet) -> Dict[str, int]:
     for req in required:
         if req not in header_index:
             next_col += 1
-            ws.cell(5, next_col, req)
+            ws.cell(row=5, column=next_col, value=req)
             header_index[req] = next_col
 
     final_map: Dict[str, int] = {}
@@ -235,26 +238,27 @@ def ensure_checklist_columns(ws: Worksheet) -> Dict[str, int]:
     return final_map
 
 
-def ensure_evidence_sheet(ws: Worksheet) -> None:
+def reset_evidence_sheet(wb: openpyxl.Workbook) -> Worksheet:
+    if "Evidence" in wb.sheetnames:
+        old_ws = wb["Evidence"]
+        wb.remove(old_ws)
+
+    ws = wb.create_sheet("Evidence")
     headers = ["Evidence ID", "指标ID", "媒体", "标题", "日期", "链接"]
     for idx, h in enumerate(headers, start=1):
-        ws.cell(1, idx, h)
-
-
-def clear_evidence(ws: Worksheet) -> None:
-    if ws.max_row > 1:
-        ws.delete_rows(2, ws.max_row - 1)
+        ws.cell(row=1, column=idx, value=h)
+    return ws
 
 
 def append_evidence(ws: Worksheet, items: List[Tuple[str, str, str, str, str, str]]) -> None:
     row = ws.max_row + 1
     for ev_id, rid, media, title, dt, link in items:
-        ws.cell(row, 1, ev_id)
-        ws.cell(row, 2, rid)
-        ws.cell(row, 3, media)
-        ws.cell(row, 4, title)
-        ws.cell(row, 5, dt)
-        ws.cell(row, 6, link)
+        ws.cell(row=row, column=1, value=ev_id)
+        ws.cell(row=row, column=2, value=rid)
+        ws.cell(row=row, column=3, value=media)
+        ws.cell(row=row, column=4, value=title)
+        ws.cell(row=row, column=5, value=dt)
+        ws.cell(row=row, column=6, value=link)
         row += 1
 
 
@@ -269,13 +273,13 @@ def set_row(
     source: str,
     note: str = "",
 ) -> None:
-    ws.cell(row, 8).value = status
-    ws.cell(row, 9).value = {"绿灯": 0, "黄灯": 1, "红灯": 2, "待更新": ""}.get(status, "")
-    ws.cell(row, colmap["状态依据（具体数据+来源）"]).value = rationale
-    ws.cell(row, colmap["证据链接 / Evidence IDs"]).value = evidence_ids
-    ws.cell(row, colmap["自动化方式"]).value = automation
-    ws.cell(row, colmap["主数据源"]).value = source
-    ws.cell(row, colmap["备注 / 下一步动作"]).value = note
+    ws.cell(row=row, column=8, value=status)
+    ws.cell(row=row, column=9, value={"绿灯": 0, "黄灯": 1, "红灯": 2, "待更新": ""}.get(status, ""))
+    ws.cell(row=row, column=colmap["状态依据（具体数据+来源）"], value=rationale)
+    ws.cell(row=row, column=colmap["证据链接 / Evidence IDs"], value=evidence_ids)
+    ws.cell(row=row, column=colmap["自动化方式"], value=automation)
+    ws.cell(row=row, column=colmap["主数据源"], value=source)
+    ws.cell(row=row, column=colmap["备注 / 下一步动作"], value=note)
 
 
 def classify_news(items: List[Dict[str, str]], yellow: int, red: int) -> str:
@@ -290,7 +294,7 @@ def classify_news(items: List[Dict[str, str]], yellow: int, red: int) -> str:
 def format_news_rationale(label: str, items: List[Dict[str, str]]) -> str:
     if not items:
         return f"过去一轮未发现明确的{label}主流媒体高相关报道。"
-    medias = sorted({x['source'] for x in items if x.get('source')})
+    medias = sorted({x["source"] for x in items if x.get("source")})
     return f"近一轮共捕获 {len(items)} 条与{label}相关报道；来源包括：{', '.join(medias[:4])}。请结合 Evidence sheet 复核是否误报。"
 
 
@@ -313,11 +317,9 @@ def main() -> None:
     wb = openpyxl.load_workbook(master)
     checklist = wb["Checklist"]
     dashboard = ensure_sheet(wb, "Dashboard")
-    evidence_ws = ensure_sheet(wb, "Evidence")
 
     colmap = ensure_checklist_columns(checklist)
-    ensure_evidence_sheet(evidence_ws)
-    clear_evidence(evidence_ws)
+    evidence_ws = reset_evidence_sheet(wb)
 
     row_map = build_row_map(checklist)
     for rid in ROW_IDS:
