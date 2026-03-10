@@ -1,4 +1,6 @@
 import argparse
+import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -19,6 +21,16 @@ def read_summary_text(output_dir: Path) -> str:
     return summary_txt.read_text(encoding="utf-8").strip()
 
 
+def read_notify_config(skill_root: Path) -> dict:
+    config_path = skill_root / "notify_config.json"
+    if not config_path.exists():
+        return {}
+    try:
+        return json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
 def build_notification_message(summary_text: str) -> str:
     lines = []
     lines.append("【Private Credit Daily Monitor】")
@@ -26,18 +38,64 @@ def build_notification_message(summary_text: str) -> str:
     return "\n".join(lines)
 
 
+def send_message_via_openclaw(channel: str, target: str, message: str) -> subprocess.CompletedProcess:
+    cmd = [
+        "openclaw",
+        "message",
+        "send",
+        "--channel",
+        channel,
+        "--target",
+        target,
+        "--message",
+        message,
+    ]
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Prepare owner notification text from last_run_summary.txt")
+    parser = argparse.ArgumentParser(description="Send owner notification from last_run_summary.txt")
     parser.add_argument("--output-dir", default="", help="Optional explicit output directory")
     args = parser.parse_args()
 
+    skill_root = Path(__file__).resolve().parents[1]
     output_dir = Path(args.output_dir).resolve() if args.output_dir else get_default_output_dir()
+
     summary_text = read_summary_text(output_dir)
     message = build_notification_message(summary_text)
 
     print("notification_message_start")
     print(message)
     print("notification_message_end")
+
+    cfg = read_notify_config(skill_root)
+    channel = str(cfg.get("notify_channel", "")).strip()
+    target = str(cfg.get("notify_target", "")).strip()
+
+    if not channel or not target:
+        print("notify_status: skipped (missing notify_channel/notify_target in notify_config.json)")
+        return
+
+    try:
+        cp = send_message_via_openclaw(channel, target, message)
+        if cp.returncode == 0:
+            print("notify_status: sent")
+            if cp.stdout.strip():
+                print("notify_send_stdout_start")
+                print(cp.stdout)
+                print("notify_send_stdout_end")
+        else:
+            print("notify_status: failed")
+            if cp.stdout.strip():
+                print("notify_send_stdout_start")
+                print(cp.stdout)
+                print("notify_send_stdout_end")
+            if cp.stderr.strip():
+                print("notify_send_stderr_start")
+                print(cp.stderr)
+                print("notify_send_stderr_end")
+    except Exception as exc:
+        print(f"notify_status: error ({exc})")
 
 
 if __name__ == "__main__":
