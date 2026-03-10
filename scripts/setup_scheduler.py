@@ -1,133 +1,66 @@
 import argparse
-import platform
-import shutil
 import subprocess
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Tuple
-
-JOB_NAME = "PrivateCreditDailyMonitor"
-DEFAULT_TIME = "09:00"
 
 
-def run_cmd(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
-    cp = subprocess.run(args, capture_output=True, text=True)
-    if check and cp.returncode != 0:
-        raise RuntimeError(cp.stderr.strip() or cp.stdout.strip() or f"Command failed: {args}")
-    return cp
+TASK_NAME = "PrivateCreditDailyMonitor"
 
 
-def parse_time(value: str) -> Tuple[str, str]:
-    parts = value.split(":")
-    if len(parts) != 2:
-        raise ValueError("Time must be in HH:MM format, e.g. 09:00")
-
-    hour, minute = parts
-    if not (hour.isdigit() and minute.isdigit()):
-        raise ValueError("Time must be numeric, e.g. 09:00")
-
-    hh = int(hour)
-    mm = int(minute)
-    if not (0 <= hh <= 23 and 0 <= mm <= 59):
-        raise ValueError("Time out of range")
-
-    return f"{hh:02d}", f"{mm:02d}"
+def build_python_command(skill_root: Path) -> str:
+    python_exe = sys.executable
+    runner = skill_root / "scripts" / "run_daily_monitor.py"
+    return f'"{python_exe}" "{runner}"'
 
 
-def setup_windows(workspace: Path, run_time: str) -> None:
-    python_exe = Path(sys.executable).resolve()
-    script_path = (Path(__file__).resolve().parents[0] / "update_monitor.py").resolve()
+def create_or_update_task(run_time: str, skill_root: Path) -> None:
+    task_cmd = build_python_command(skill_root)
 
-    task_cmd = f'"{python_exe}" "{script_path}" --workspace "{workspace}"'
-    hh, mm = parse_time(run_time)
-    st = f"{hh}:{mm}"
+    # 先删除旧任务（如果存在）
+    subprocess.run(
+        ["schtasks", "/Delete", "/TN", TASK_NAME, "/F"],
+        capture_output=True,
+        text=True,
+    )
 
-    args = [
+    # 创建新任务
+    create_cmd = [
         "schtasks",
         "/Create",
-        "/TN",
-        JOB_NAME,
-        "/SC",
-        "DAILY",
-        "/ST",
-        st,
-        "/TR",
-        task_cmd,
+        "/SC", "DAILY",
+        "/TN", TASK_NAME,
+        "/TR", task_cmd,
+        "/ST", run_time,
         "/F",
     ]
-    run_cmd(args)
 
-    print(f"Task created/updated: {JOB_NAME}")
-    print(f"Run time (local machine time): {st}")
-    print(f'Verify with: schtasks /Query /TN "{JOB_NAME}"')
+    cp = subprocess.run(create_cmd, capture_output=True, text=True)
+    if cp.returncode != 0:
+        raise RuntimeError(cp.stderr.strip() or cp.stdout.strip() or "Failed to create scheduled task")
+
+    print(f"Task created/updated: {TASK_NAME}")
+    print(f"Run time (local machine time): {run_time}")
+    print(f"Command: {task_cmd}")
+    print(f'Verify with: schtasks /Query /TN "{TASK_NAME}"')
 
 
-def setup_posix(workspace: Path, run_time: str) -> None:
-    python_exe = Path(sys.executable).resolve()
-    script_path = (Path(__file__).resolve().parents[0] / "update_monitor.py").resolve()
-
-    hh, mm = parse_time(run_time)
-    cron_line = f'{mm} {hh} * * * "{python_exe}" "{script_path}" --workspace "{workspace}"\n'
-    marker = f"# {JOB_NAME}"
-
-    existing = ""
-    cp = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
-    if cp.returncode == 0:
-        existing = cp.stdout
-    elif "no crontab" in (cp.stderr or "").lower():
-        existing = ""
-    else:
-        raise RuntimeError(cp.stderr.strip() or cp.stdout.strip())
-
-    lines = existing.splitlines()
-    filtered: list[str] = []
-    skip_next = False
-
-    for line in lines:
-        if line.strip() == marker:
-            skip_next = True
-            continue
-        if skip_next:
-            skip_next = False
-            continue
-        filtered.append(line)
-
-    filtered.append(marker)
-    filtered.append(cron_line.rstrip("\n"))
-    new_content = "\n".join(filtered).strip() + "\n"
-
-    cp_set = subprocess.run(["crontab", "-"], input=new_content, capture_output=True, text=True)
-    if cp_set.returncode != 0:
-        raise RuntimeError(cp_set.stderr.strip() or cp_set.stdout.strip())
-
-    print(f"Cron entry created/updated: {JOB_NAME}")
-    print(f"Run time (local machine time): {hh}:{mm}")
-    print("Verify with: crontab -l")
+def parse_time(value: str) -> str:
+    try:
+        dt = datetime.strptime(value, "%H:%M")
+        return dt.strftime("%H:%M")
+    except Exception:
+        raise argparse.ArgumentTypeError("Time must be in HH:MM format")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Create or update daily system scheduler for private credit monitor")
-    parser.add_argument("--workspace", default=".", help="Workspace directory for output files")
-    parser.add_argument("--time", default=DEFAULT_TIME, help="Daily run time in HH:MM, local machine time")
+    parser = argparse.ArgumentParser(description="Create/update Windows scheduled task for Private Credit Daily Monitor")
+    parser.add_argument("--time", required=True, type=parse_time, help="Daily run time in HH:MM local time")
+    parser.add_argument("--workspace", default=".", help="Reserved for compatibility; not used by the scheduler")
     args = parser.parse_args()
 
-    workspace = Path(args.workspace).resolve()
-    workspace.mkdir(parents=True, exist_ok=True)
-
-    system_name = platform.system().lower()
-
-    try:
-        if system_name == "windows":
-            if not shutil.which("schtasks"):
-                raise RuntimeError("schtasks not found")
-            setup_windows(workspace, args.time)
-        else:
-            if not shutil.which("crontab"):
-                raise RuntimeError("crontab not found")
-            setup_posix(workspace, args.time)
-    except Exception as exc:
-        print(f"Failed to set up scheduler: {exc}")
-        sys.exit(1)
+    skill_root = Path(__file__).resolve().parents[1]
+    create_or_update_task(args.time, skill_root)
 
 
 if __name__ == "__main__":
