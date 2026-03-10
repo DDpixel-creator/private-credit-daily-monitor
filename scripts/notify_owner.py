@@ -1,7 +1,7 @@
 import argparse
 import json
+import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 
@@ -38,9 +38,23 @@ def build_notification_message(summary_text: str) -> str:
     return "\n".join(lines)
 
 
-def send_message_via_openclaw(channel: str, target: str, message: str) -> subprocess.CompletedProcess:
-    cmd = [
+def resolve_openclaw_executable() -> str:
+    candidates = [
         "openclaw",
+        "openclaw.cmd",
+        "openclaw.exe",
+    ]
+    for name in candidates:
+        path = shutil.which(name)
+        if path:
+            return path
+    raise FileNotFoundError("openclaw executable not found in PATH")
+
+
+def send_message_via_openclaw(channel: str, target: str, message: str) -> subprocess.CompletedProcess:
+    openclaw_exe = resolve_openclaw_executable()
+    cmd = [
+        openclaw_exe,
         "message",
         "send",
         "--channel",
@@ -94,6 +108,8 @@ def main() -> None:
                 print("notify_send_stderr_start")
                 print(cp.stderr)
                 print("notify_send_stderr_end")
+    except FileNotFoundError as exc:
+        print(f"notify_status: error_openclaw_not_found ({exc})")
     except Exception as exc:
         print(f"notify_status: error ({exc})")
 
