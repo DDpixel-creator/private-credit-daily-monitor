@@ -32,23 +32,19 @@ def read_notify_config(skill_root: Path) -> dict:
 
 
 def build_notification_message(summary_text: str) -> str:
-    lines = []
-    lines.append("【Private Credit Daily Monitor】")
-    lines.append(summary_text)
-    return "\n".join(lines)
+    return "【Private Credit Daily Monitor】\n" + summary_text
 
 
 def resolve_openclaw_executable() -> str:
-    candidates = [
-        "openclaw",
-        "openclaw.cmd",
-        "openclaw.exe",
-    ]
-    for name in candidates:
+    for name in ["openclaw", "openclaw.cmd", "openclaw.exe"]:
         path = shutil.which(name)
         if path:
             return path
     raise FileNotFoundError("openclaw executable not found in PATH")
+
+
+def safe_text(value) -> str:
+    return value if isinstance(value, str) else ""
 
 
 def send_message_via_openclaw(channel: str, target: str, message: str) -> subprocess.CompletedProcess:
@@ -64,7 +60,13 @@ def send_message_via_openclaw(channel: str, target: str, message: str) -> subpro
         "--message",
         message,
     ]
-    return subprocess.run(cmd, capture_output=True, text=True)
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
 
 
 def main() -> None:
@@ -92,22 +94,26 @@ def main() -> None:
 
     try:
         cp = send_message_via_openclaw(channel, target, message)
+        stdout_text = safe_text(cp.stdout).strip()
+        stderr_text = safe_text(cp.stderr).strip()
+
         if cp.returncode == 0:
             print("notify_status: sent")
-            if cp.stdout.strip():
+            if stdout_text:
                 print("notify_send_stdout_start")
-                print(cp.stdout)
+                print(stdout_text)
                 print("notify_send_stdout_end")
         else:
             print("notify_status: failed")
-            if cp.stdout.strip():
+            if stdout_text:
                 print("notify_send_stdout_start")
-                print(cp.stdout)
+                print(stdout_text)
                 print("notify_send_stdout_end")
-            if cp.stderr.strip():
+            if stderr_text:
                 print("notify_send_stderr_start")
-                print(cp.stderr)
+                print(stderr_text)
                 print("notify_send_stderr_end")
+
     except FileNotFoundError as exc:
         print(f"notify_status: error_openclaw_not_found ({exc})")
     except Exception as exc:
