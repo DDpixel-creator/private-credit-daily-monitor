@@ -1,6 +1,5 @@
 import ast
 import json
-import re
 import subprocess
 import sys
 from datetime import datetime
@@ -22,6 +21,15 @@ def run_update(skill_root: Path, output_dir: Path) -> subprocess.CompletedProces
         raise FileNotFoundError(f"update_monitor.py not found: {update_script}")
 
     cmd = [sys.executable, str(update_script), "--workspace", str(output_dir)]
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def run_notify(skill_root: Path, output_dir: Path) -> subprocess.CompletedProcess:
+    notify_script = skill_root / "scripts" / "notify_owner.py"
+    if not notify_script.exists():
+        raise FileNotFoundError(f"notify_owner.py not found: {notify_script}")
+
+    cmd = [sys.executable, str(notify_script), "--output-dir", str(output_dir)]
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
@@ -188,6 +196,18 @@ def main() -> None:
     print(result.stdout)
     if result.stderr.strip():
         print(result.stderr)
+
+    try:
+        notify_result = run_notify(skill_root, output_dir)
+        print("notify_stdout_start")
+        print(notify_result.stdout)
+        print("notify_stdout_end")
+        if notify_result.stderr.strip():
+            print("notify_stderr_start")
+            print(notify_result.stderr)
+            print("notify_stderr_end")
+    except Exception as exc:
+        print(f"notify_error: {exc}")
 
     sys.exit(0 if success else 1)
 
