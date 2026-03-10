@@ -6,7 +6,8 @@ import shutil
 import statistics
 import time
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Dict, List, Tuple
 from urllib.parse import quote_plus
@@ -30,75 +31,170 @@ ROW_IDS = [
 
 NEWS_RULES = {
     "EW-01": {
-        "query": '"private credit" OR BDC gate OR "redemption suspension" OR "withdrawal suspension" OR "redemption limit"',
+        "query": '"private credit" gate OR "redemption suspension" OR "withdrawal suspension" OR "redemption limit"',
         "automation": "新闻聚类",
         "source": "Google News RSS / 主流媒体",
-        "yellow": 1,
-        "red": 3,
         "label": "限赎 / Gate",
+        "lookback_days": 45,
+        "yellow_min_articles": 1,
+        "yellow_min_sources": 1,
+        "red_min_articles": 3,
+        "red_min_sources": 3,
+        "must_have_any": [
+            "gate",
+            "redemption suspension",
+            "withdrawal suspension",
+            "redemption limit",
+            "limits withdrawals",
+            "limited withdrawals",
+            "limits redemptions",
+            "redemptions at",
+        ],
     },
     "EW-05": {
         "query": '"private credit" fraud OR "valuation dispute" OR default OR restructuring OR "payment suspension"',
         "automation": "新闻聚类",
         "source": "Google News RSS / 主流媒体",
-        "yellow": 2,
-        "red": 5,
         "label": "坏消息簇发",
+        "lookback_days": 21,
+        "yellow_min_articles": 2,
+        "yellow_min_sources": 2,
+        "red_min_articles": 5,
+        "red_min_sources": 4,
+        "must_have_any": [
+            "fraud",
+            "valuation dispute",
+            "default",
+            "restructuring",
+            "payment suspension",
+            "writes down",
+            "writedown",
+            "write-down",
+            "credit jitters",
+            "distress",
+        ],
     },
     "TR-01": {
         "query": '"private credit" default OR restructuring OR "amend and extend" OR "debt exchange"',
         "automation": "新闻聚类",
         "source": "Google News RSS / 主流媒体",
-        "yellow": 2,
-        "red": 5,
         "label": "违约 / 重组 / 展期",
+        "lookback_days": 30,
+        "yellow_min_articles": 2,
+        "yellow_min_sources": 2,
+        "red_min_articles": 4,
+        "red_min_sources": 3,
+        "must_have_any": [
+            "default",
+            "restructuring",
+            "amend and extend",
+            "extend maturities",
+            "debt exchange",
+            "debt restructuring",
+            "missed payment",
+        ],
     },
     "TR-02": {
         "query": '"private credit" PIK OR "paid in kind" OR "payment in kind"',
         "automation": "新闻聚类",
         "source": "Google News RSS / 主流媒体",
-        "yellow": 1,
-        "red": 3,
         "label": "PIK 增多",
+        "lookback_days": 45,
+        "yellow_min_articles": 1,
+        "yellow_min_sources": 1,
+        "red_min_articles": 3,
+        "red_min_sources": 3,
+        "must_have_any": [
+            "pik",
+            "paid in kind",
+            "payment in kind",
+        ],
     },
     "TR-04": {
         "query": '"private credit" fundraising slowdown OR "fundraising slows" OR "difficult to raise" OR "fund close delayed"',
         "automation": "新闻聚类",
         "source": "Google News RSS / 主流媒体",
-        "yellow": 2,
-        "red": 5,
         "label": "募资放缓",
+        "lookback_days": 45,
+        "yellow_min_articles": 2,
+        "yellow_min_sources": 2,
+        "red_min_articles": 4,
+        "red_min_sources": 3,
+        "must_have_any": [
+            "fundraising slowdown",
+            "fundraising slows",
+            "difficult to raise",
+            "fund close delayed",
+            "slower fundraising",
+            "harder to raise",
+            "fundraising environment",
+        ],
     },
     "TR-05": {
         "query": '"private credit" tighter terms OR covenant OR "spread wider" OR "deal pulled" OR "financing delayed"',
         "automation": "新闻聚类",
         "source": "Google News RSS / 主流媒体",
-        "yellow": 2,
-        "red": 5,
         "label": "条款收紧",
+        "lookback_days": 30,
+        "yellow_min_articles": 2,
+        "yellow_min_sources": 2,
+        "red_min_articles": 4,
+        "red_min_sources": 3,
+        "must_have_any": [
+            "tighter terms",
+            "covenant",
+            "spread wider",
+            "deal pulled",
+            "financing delayed",
+            "tougher terms",
+            "higher spreads",
+            "stricter terms",
+        ],
     },
     "SY-03": {
         "query": '"private credit" pension reduce allocation OR insurer reduce allocation OR "trim exposure" OR "cut allocation"',
         "automation": "新闻聚类",
         "source": "Google News RSS / 主流媒体",
-        "yellow": 1,
-        "red": 3,
         "label": "长钱减配",
+        "lookback_days": 60,
+        "yellow_min_articles": 1,
+        "yellow_min_sources": 1,
+        "red_min_articles": 3,
+        "red_min_sources": 3,
+        "must_have_any": [
+            "reduce allocation",
+            "trim exposure",
+            "cut allocation",
+            "lower allocation",
+            "reduce exposure",
+        ],
     },
     "SY-05": {
         "query": '"small business" refinancing failure OR bankruptcy OR layoffs OR capex cuts OR "unable to refinance"',
         "automation": "新闻聚类",
         "source": "Google News RSS / 主流媒体",
-        "yellow": 3,
-        "red": 6,
         "label": "中小企业再融资失败",
+        "lookback_days": 30,
+        "yellow_min_articles": 3,
+        "yellow_min_sources": 2,
+        "red_min_articles": 6,
+        "red_min_sources": 4,
+        "must_have_any": [
+            "unable to refinance",
+            "refinancing failure",
+            "bankruptcy",
+            "layoffs",
+            "capex cuts",
+            "cannot refinance",
+            "struggles to refinance",
+        ],
     },
 }
 
 MANAGER_STOCKS = ["BLK", "BX", "APO", "ARES", "OWL", "KKR"]
 ALL_STOOQ = [
     "SPY", "XLF", "KBE", "BLK", "BX", "APO", "ARES", "OWL", "KKR",
-    "BIZD", "HYG", "BKLN", "JBBB", "LQD", "JNK"
+    "BIZD", "HYG", "BKLN", "JBBB", "LQD", "JNK",
 ]
 FRED_SERIES = {
     "HY_OAS": "BAMLH0A0HYM2",
@@ -152,7 +248,58 @@ def fred_last(series: str) -> Dict[str, float | str]:
     return {"date": last["observation_date"], "value": float(last[series])}
 
 
-def google_news_rss(query: str, max_items: int = 8) -> List[Dict[str, str]]:
+def parse_pub_date(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        dt = parsedate_to_datetime(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def clean_title_for_dedupe(title: str) -> str:
+    title = title.lower()
+    title = re.sub(r"\s+", " ", title)
+    title = re.sub(r"[^\w\s]", "", title)
+    return title.strip()
+
+
+def normalize_source(source: str) -> str:
+    s = (source or "").strip()
+    if not s:
+        return "Unknown"
+
+    lower = s.lower()
+    if "reuters" in lower:
+        return "Reuters"
+    if "financial times" in lower or lower == "ft":
+        return "Financial Times"
+    if "bloomberg" in lower:
+        return "Bloomberg"
+    if "wall street journal" in lower or lower == "wsj":
+        return "WSJ"
+    if "cnbc" in lower:
+        return "CNBC"
+    if "marketwatch" in lower:
+        return "MarketWatch"
+    if "yahoo" in lower:
+        return "Yahoo"
+    if "investmentnews" in lower:
+        return "InvestmentNews"
+    if "sec" in lower:
+        return "SEC"
+    return s
+
+
+def title_matches_keywords(title: str, keywords: List[str]) -> bool:
+    t = title.lower()
+    return any(k.lower() in t for k in keywords)
+
+
+def google_news_rss(query: str, max_items: int = 20) -> List[Dict[str, str]]:
     url = f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=en-US&gl=US&ceid=US:en"
     xml_text = fetch_text(url)
     root = ET.fromstring(xml_text)
@@ -164,25 +311,80 @@ def google_news_rss(query: str, max_items: int = 8) -> List[Dict[str, str]]:
         title = (item.findtext("title") or "").strip()
         link = (item.findtext("link") or "").strip()
         pub_date = (item.findtext("pubDate") or "").strip()
+
         source = ""
         source_node = item.find("source")
         if source_node is not None and source_node.text:
             source = source_node.text.strip()
 
-        norm = re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", title.lower())).strip()
-        if not norm or norm in seen:
+        dedupe_key = clean_title_for_dedupe(title)
+        if not dedupe_key or dedupe_key in seen:
             continue
-        seen.add(norm)
+        seen.add(dedupe_key)
 
         results.append({
             "title": title,
             "link": link,
             "date": pub_date,
-            "source": source or "Google News RSS",
+            "source": normalize_source(source or "Google News RSS"),
         })
         if len(results) >= max_items:
             break
+
     return results
+
+
+def filter_news_items(items: List[Dict[str, str]], rule: Dict[str, object]) -> List[Dict[str, str]]:
+    now_utc = datetime.now(timezone.utc)
+    lookback_days = int(rule["lookback_days"])
+    cutoff = now_utc - timedelta(days=lookback_days)
+    keywords = list(rule["must_have_any"])
+
+    filtered: List[Dict[str, str]] = []
+    seen_titles = set()
+
+    for item in items:
+        pub_dt = parse_pub_date(item.get("date", ""))
+        if pub_dt is None:
+            continue
+        if pub_dt < cutoff:
+            continue
+
+        title = item.get("title", "")
+        if not title_matches_keywords(title, keywords):
+            continue
+
+        dedupe_key = clean_title_for_dedupe(title)
+        if dedupe_key in seen_titles:
+            continue
+        seen_titles.add(dedupe_key)
+
+        filtered.append(item)
+
+    return filtered
+
+
+def classify_news(rule: Dict[str, object], items: List[Dict[str, str]]) -> str:
+    count = len(items)
+    source_count = len({normalize_source(x.get("source", "")) for x in items if x.get("source")})
+
+    if count >= int(rule["red_min_articles"]) and source_count >= int(rule["red_min_sources"]):
+        return "红灯"
+    if count >= int(rule["yellow_min_articles"]) and source_count >= int(rule["yellow_min_sources"]):
+        return "黄灯"
+    return "绿灯"
+
+
+def format_news_rationale(label: str, items: List[Dict[str, str]], lookback_days: int) -> str:
+    if not items:
+        return f"最近 {lookback_days} 天未发现明确的{label}主流媒体高相关报道。"
+
+    medias = sorted({normalize_source(x["source"]) for x in items if x.get("source")})
+    return (
+        f"最近 {lookback_days} 天共捕获 {len(items)} 条与{label}高度相关报道，"
+        f"涉及 {len(medias)} 个来源；来源包括：{', '.join(medias[:5])}。"
+        f"请结合 Evidence sheet 复核是否误报。"
+    )
 
 
 def ensure_workbook(master: Path, asset_template: Path) -> None:
@@ -282,22 +484,6 @@ def set_row(
     ws.cell(row=row, column=colmap["备注 / 下一步动作"], value=note)
 
 
-def classify_news(items: List[Dict[str, str]], yellow: int, red: int) -> str:
-    count = len(items)
-    if count >= red:
-        return "红灯"
-    if count >= yellow:
-        return "黄灯"
-    return "绿灯"
-
-
-def format_news_rationale(label: str, items: List[Dict[str, str]]) -> str:
-    if not items:
-        return f"过去一轮未发现明确的{label}主流媒体高相关报道。"
-    medias = sorted({x["source"] for x in items if x.get("source")})
-    return f"近一轮共捕获 {len(items)} 条与{label}相关报道；来源包括：{', '.join(medias[:4])}。请结合 Evidence sheet 复核是否误报。"
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="Update private credit monitor workbook using formal template")
     parser.add_argument("--workspace", default=".", help="Workspace directory")
@@ -348,16 +534,24 @@ def main() -> None:
         cfg = NEWS_RULES[rid]
         row = row_map[rid]
         try:
-            items = google_news_rss(cfg["query"], max_items=6)
-            status = classify_news(items, cfg["yellow"], cfg["red"])
-            rationale = format_news_rationale(cfg["label"], items)
+            raw_items = google_news_rss(str(cfg["query"]), max_items=20)
+            items = filter_news_items(raw_items, cfg)
+            status = classify_news(cfg, items)
+            rationale = format_news_rationale(str(cfg["label"]), items, int(cfg["lookback_days"]))
 
             ev_ids: List[str] = []
             for item in items[:5]:
                 ev_id = f"EV-{evidence_counter:03d}"
                 evidence_counter += 1
                 ev_ids.append(ev_id)
-                evidence_rows.append((ev_id, rid, item["source"], item["title"], item["date"], item["link"]))
+                evidence_rows.append((
+                    ev_id,
+                    rid,
+                    normalize_source(item["source"]),
+                    item["title"],
+                    item["date"],
+                    item["link"],
+                ))
 
             set_row(
                 checklist,
@@ -366,8 +560,8 @@ def main() -> None:
                 status,
                 rationale,
                 ", ".join(ev_ids),
-                cfg["automation"],
-                cfg["source"],
+                str(cfg["automation"]),
+                str(cfg["source"]),
             )
         except Exception as exc:
             set_row(
@@ -377,8 +571,8 @@ def main() -> None:
                 "待更新",
                 f"新闻抓取失败：{exc}",
                 "",
-                cfg["automation"],
-                cfg["source"],
+                str(cfg["automation"]),
+                str(cfg["source"]),
             )
 
     for rid in ["EW-01", "EW-05", "TR-01", "TR-02", "TR-04", "TR-05", "SY-03", "SY-05"]:
@@ -456,15 +650,28 @@ def main() -> None:
     rid = "SY-02"
     row = row_map[rid]
     try:
-        bank_news = google_news_rss('"bank provisions" OR "loan loss provisions" OR "credit reserves" banks', max_items=5)
-        bank_status = classify_news(bank_news, 2, 4)
-        ev_ids: List[str] = []
+        bank_news_raw = google_news_rss('"bank provisions" OR "loan loss provisions" OR "credit reserves" banks', max_items=12)
+        bank_news = filter_news_items(bank_news_raw, {
+            "lookback_days": 45,
+            "must_have_any": ["provisions", "loan loss", "credit reserves", "reserve build", "reserve increase"],
+            "yellow_min_articles": 2,
+            "yellow_min_sources": 2,
+            "red_min_articles": 4,
+            "red_min_sources": 3,
+        })
+        bank_status = classify_news({
+            "yellow_min_articles": 2,
+            "yellow_min_sources": 2,
+            "red_min_articles": 4,
+            "red_min_sources": 3,
+        }, bank_news)
 
+        ev_ids: List[str] = []
         for item in bank_news[:4]:
             ev_id = f"EV-{evidence_counter:03d}"
             evidence_counter += 1
             ev_ids.append(ev_id)
-            evidence_rows.append((ev_id, rid, item["source"], item["title"], item["date"], item["link"]))
+            evidence_rows.append((ev_id, rid, normalize_source(item["source"]), item["title"], item["date"], item["link"]))
 
         if "KBE" in market:
             kbe = market["KBE"]["chg5d"]
@@ -474,10 +681,10 @@ def main() -> None:
                 status = "红灯"
             else:
                 status = "黄灯"
-            rationale = f"银行拨备相关新闻 {len(bank_news)} 条；KBE 5日 {kbe:.2f}%。结合新闻与银行股表现判断。"
+            rationale = f"最近 45 天银行拨备相关新闻 {len(bank_news)} 条；KBE 5日 {kbe:.2f}%。结合新闻与银行股表现判断。"
         else:
             status = bank_status
-            rationale = f"银行拨备相关新闻 {len(bank_news)} 条。缺少 KBE 价格时仅按新闻聚类判断。"
+            rationale = f"最近 45 天银行拨备相关新闻 {len(bank_news)} 条。缺少 KBE 价格时仅按新闻聚类判断。"
 
         set_row(checklist, row, colmap, status, rationale, ", ".join(ev_ids), "混合：新闻+代理数值", "Google News RSS + Stooq")
     except Exception as exc:
