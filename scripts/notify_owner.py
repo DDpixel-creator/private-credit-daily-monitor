@@ -2,6 +2,7 @@ import argparse
 import json
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 
@@ -35,6 +36,12 @@ def build_notification_message(summary_text: str) -> str:
     return "【Private Credit Daily Monitor】\n" + summary_text
 
 
+def build_single_line_message(summary_text: str) -> str:
+    lines = [line.strip() for line in summary_text.splitlines() if line.strip()]
+    body = " | ".join(lines)
+    return f"【Private Credit Daily Monitor】 {body}"
+
+
 def resolve_openclaw_executable() -> str:
     for name in ["openclaw", "openclaw.cmd", "openclaw.exe"]:
         path = shutil.which(name)
@@ -47,7 +54,7 @@ def safe_text(value) -> str:
     return value if isinstance(value, str) else ""
 
 
-def send_message_via_openclaw(channel: str, target: str, message: str) -> subprocess.CompletedProcess:
+def run_openclaw_send(channel: str, target: str, message: str) -> subprocess.CompletedProcess:
     openclaw_exe = resolve_openclaw_executable()
     cmd = [
         openclaw_exe,
@@ -60,13 +67,36 @@ def send_message_via_openclaw(channel: str, target: str, message: str) -> subpro
         "--message",
         message,
     ]
+
+    env = dict()
+    env.update(**subprocess.os.environ)
+    env["PYTHONUTF8"] = "1"
+
     return subprocess.run(
         cmd,
         capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
+        env=env,
     )
+
+
+def write_debug_message_file(message: str) -> Path:
+    temp_dir = Path(tempfile.gettempdir())
+    path = temp_dir / "private_credit_notify_message.txt"
+    path.write_text(message, encoding="utf-8")
+    return path
+
+
+def send_message_via_openclaw(channel: str, target: str, message: str) -> subprocess.CompletedProcess:
+    """
+    Windows Scheduled Task 下，长多行中文参数可能被截断。
+    为了提高稳定性，这里统一发送单行压缩版。
+    完整多行正文仍会打印到日志，便于排查。
+    """
+    single_line_message = build_single_line_message(message.replace("【Private Credit Daily Monitor】\n", "", 1))
+    return run_openclaw_send(channel, target, single_line_message)
 
 
 def main() -> None:
@@ -83,6 +113,12 @@ def main() -> None:
     print("notification_message_start")
     print(message)
     print("notification_message_end")
+
+    try:
+        debug_path = write_debug_message_file(message)
+        print(f"notification_debug_file: {debug_path}")
+    except Exception as exc:
+        print(f"notification_debug_file_error: {exc}")
 
     cfg = read_notify_config(skill_root)
     channel = str(cfg.get("notify_channel", "")).strip()
@@ -113,6 +149,27 @@ def main() -> None:
                 print("notify_send_stderr_start")
                 print(stderr_text)
                 print("notify_send_stderr_end")
+
+            # 兜底：失败时尝试发送更短的极简单行版本
+            fallback_message = "【Private Credit Daily Monitor】 通知发送失败，请查看本地输出目录：C:\\Users\\darry\\Documents\\PrivateCreditDailyMonitor"
+            print("notify_fallback_attempt_start")
+            cp2 = run_openclaw_send(channel, target, fallback_message)
+            stdout_text2 = safe_text(cp2.stdout).strip()
+            stderr_text2 = safe_text(cp2.stderr).strip()
+
+            if cp2.returncode == 0:
+                print("notify_fallback_status: sent")
+            else:
+                print("notify_fallback_status: failed")
+
+            if stdout_text2:
+                print("notify_fallback_stdout_start")
+                print(stdout_text2)
+                print("notify_fallback_stdout_end")
+            if stderr_text2:
+                print("notify_fallback_stderr_start")
+                print(stderr_text2)
+                print("notify_fallback_stderr_end")
 
     except FileNotFoundError as exc:
         print(f"notify_status: error_openclaw_not_found ({exc})")
