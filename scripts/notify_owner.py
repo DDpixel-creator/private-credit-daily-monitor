@@ -133,22 +133,18 @@ def main() -> None:
         stdout_text = safe_text(cp.stdout).strip()
         stderr_text = safe_text(cp.stderr).strip()
 
-        if cp.returncode == 0:
-            print("notify_status: sent")
-            if stdout_text:
-                print("notify_send_stdout_start")
-                print(stdout_text)
-                print("notify_send_stdout_end")
-        else:
-            print("notify_status: failed")
-            if stdout_text:
-                print("notify_send_stdout_start")
-                print(stdout_text)
-                print("notify_send_stdout_end")
-            if stderr_text:
-                print("notify_send_stderr_start")
-                print(stderr_text)
-                print("notify_send_stderr_end")
+       if cp.returncode == 0:
+           print("notify_status: sent")
+       else:
+           print("notify_status: failed")
+           if stdout_text:
+               print("notify_send_stdout_start")
+               print(stdout_text)
+               print("notify_send_stdout_end")
+           if stderr_text:
+               print("notify_send_stderr_start")
+               print(stderr_text)
+               print("notify_send_stderr_end")
 
             # 兜底：失败时尝试发送更短的极简单行版本
             fallback_message = "【Private Credit Daily Monitor】 通知发送失败，请查看本地输出目录：C:\\Users\\darry\\Documents\\PrivateCreditDailyMonitor"
